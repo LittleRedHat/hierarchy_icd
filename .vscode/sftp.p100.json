@@ -1,0 +1,23 @@
+
+{
+    "host": "p100",
+    "port": 22,
+    "username": "xiexc",
+    "password": "!@#QWEasd",
+    "protocol": "sftp",
+    "interactiveAuth": true,
+    "remotePath": "/home/xiexc/workspace/hierarchy_icd",
+    "uploadOnSave": false,
+    "syncMode": "update",
+    "ignore": [
+        "**/.vscode/**",
+        "**/.git/**",
+        "**/.DS_Store"
+    ],
+    "watcher": {
+        "files": "glob",
+        "autoUpload": true,
+        "autoDelete": true
+    }
+    
+}

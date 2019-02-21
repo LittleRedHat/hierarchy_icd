@@ -1,0 +1,18 @@
+python train.py --vocab_file ./mimicdata/mimic3/vocab.csv \
+                --code_file ./mimicdata/mimic3/FULL_CODES.csv \
+                --embed_file ./mimicdata/mimic3/processed_full.embed \
+                --description_file ./mimicdata/mimic3/description_vectors.vocab \
+                --train_file ./mimicdata/mimic3/train_FULL.csv \
+                --dev_file ./mimicdata/mimic3/dev_FULL.csv \
+                --test_file ./mimicdata/mimic3/test_FULL.csv \
+                --save_dir caml_full \
+                --batch_size 16 \
+                --gpus 6 \
+                --epochs 100 \
+                --lmbda 0 \
+                --num_filter_maps 50 \
+                --word_kernel_sizes 10 \
+                --nw 0 \
+                --lr 0.0001 \
+                --log_frq 10 \
+                --method caml

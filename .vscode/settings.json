@@ -1,0 +1,4 @@
+{
+    "python.pythonPath": "/Users/zookeeper/miniconda3/envs/torch/bin/python",
+    "python.linting.pylintEnabled": false
+}

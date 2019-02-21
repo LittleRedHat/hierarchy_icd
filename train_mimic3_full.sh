@@ -1,0 +1,19 @@
+python train.py --vocab_file ./mimicdata/mimic3/vocab.csv \
+                --code_file ./mimicdata/mimic3/FULL_CODES.csv \
+                --embed_file ./mimicdata/mimic3/processed_full.embed \
+                --description_file ./mimicdata/mimic3/description_vectors.vocab \
+                --train_file ./mimicdata/mimic3/train_FULL.csv \
+                --dev_file ./mimicdata/mimic3/dev_FULL.csv \
+                --test_file ./mimicdata/mimic3/test_FULL.csv \
+                --save_dir structure \
+                --batch_size 32 \
+                --gpus 2 \
+                --epochs 200 \
+                --lmbda 0 \
+                --nw 0 \
+                --lr 0.0001 \
+                --num_filter_maps 50 \
+                --word_kernel_sizes 10,8,6,4 \
+                --section_kernel_size 4 \
+                --method hierarchy \
+                --log_frq 10
