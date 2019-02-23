@@ -58,23 +58,6 @@ class MIMICDataset(Dataset):
             if remained_length <= 0:
                 break
             
-            topic = str(section['topic']).lower()
-            allowed_topics = [
-                   'discharge diagnosis',
-                   'brief hospital course',
-                   'major surgical or invasive procedure',
-                   'history of present illness',
-                   'pertinent results',
-                   'imaging',
-                   'physical exam',
-                   'addendum',
-                   'discharge instructions',
-                   'followup instructions',
-                   'discharge instructions'
-            ]
-            if topic not in allowed_topics:
-                continue
-            
             content = section['content'].split()
 
             actual_added_length = min(remained_length, len(content))

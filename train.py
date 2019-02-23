@@ -19,7 +19,7 @@ import numpy as np
 from torch import optim
 import torch.nn as nn
 import torch.nn.functional as F
-from models.models import StrutureAwareHCN
+from models.models import StrutureAwareHCN, MultiScaleCNN
 from models.metrics import all_metrics
 from collections import defaultdict
 from tqdm import tqdm
@@ -81,22 +81,36 @@ class Trainer:
             self.leaf_idxs = None
     
     def _build_model(self, args):
-        model = StrutureAwareHCN(num_classes = args.Y, 
-                                embed_size = args.embed_size, 
-                                word_kernel_sizes=args.word_kernel_sizes, 
-                                section_kernel_size=args.section_kernel_size,
-                                label_kernel_size = args.label_kernel_size,
-                                num_filter_maps=args.num_filter_maps,
-                                dropout=args.dropout,
-                                vocab_size=args.vocab_size,
-                                init_embeds = self.init_embed,
-                                code_embeds = self.code_embed,
-                                lmbda=args.lmbda,
-                                method=args.method,
-                                use_ontology=args.use_ontology,
-                                use_hierarchy=args.use_hierarchy,
-                                total_num_classes=args.total_number_classes
-                                )
+        if args.method in ['multiscale']:
+            model = MultiScaleCNN(
+                num_classes=args.Y,
+                embed_size = args.embed_size,
+                num_filter_maps=args.num_filter_maps,
+                dropout=args.dropout,
+                num_layers= args.num_layers,
+                vocab_size=args.vocab_size,
+                init_embeds = self.init_embed,
+                drop_rate=args.drop_rate,
+                use_ontology=args.use_ontology,
+                total_num_classes=args.total_number_classes
+            )
+        else:
+            model = StrutureAwareHCN(num_classes = args.Y, 
+                                    embed_size = args.embed_size, 
+                                    word_kernel_sizes=args.word_kernel_sizes, 
+                                    section_kernel_size=args.section_kernel_size,
+                                    label_kernel_size = args.label_kernel_size,
+                                    num_filter_maps=args.num_filter_maps,
+                                    dropout=args.dropout,
+                                    vocab_size=args.vocab_size,
+                                    init_embeds = self.init_embed,
+                                    code_embeds = self.code_embed,
+                                    lmbda=args.lmbda,
+                                    method=args.method,
+                                    use_ontology=args.use_ontology,
+                                    use_hierarchy=args.use_hierarchy,
+                                    total_num_classes=args.total_number_classes
+                                    )
         return model
     
     def _build_optimizer(self, parameters, args={}):
@@ -114,6 +128,9 @@ class Trainer:
         metrics_hist_tr = defaultdict(lambda: [])
 
         model = self.model
+
+        if torch.cuda.device_count() > 1:
+            model = nn.DataParallel(model)
        
         print('start training .....................')
 
@@ -137,17 +154,12 @@ class Trainer:
             }
             torch.save(info_to_save,os.path.join(self.args.save_dir,'model_{}.pth.tar'.format(epoch)))
 
-
-
-            
-
     def train_epoch(self, epoch, model, train_dataloader, dev_dataloader = None, test_dataloader = None, args={}):
         print('training epoch {}'.format(epoch))
         start_time = time.time()
         dicts = train_dataloader.dataset.dicts
         ind2w, w2ind, ind2c, c2ind = dicts['ind2w'], dicts['w2ind'], dicts['ind2c'], dicts['c2ind']
         unseen_code_inds = set(ind2c.keys())
-        desc_embed = model.lmbda > 0
         model.train()
 
         ind2c = train_dataloader.dataset.dicts['ind2c']
@@ -171,9 +183,9 @@ class Trainer:
                 
             self.optimizer.zero_grad()
             logits, contexts, _, _  = model(docs, doc_masks, doc_lengths, section_masks, section_lengths, adj = self.adj, leaf_idxs = self.leaf_idxs)
-            bce_loss = model.get_multilabel_loss(labels, logits)
+            bce_loss = self.model.get_multilabel_loss(labels, logits)
             if args.lmbda > 0:
-                reg_loss = model.get_label_reg_loss(desc_vectors, contexts, labels)
+                reg_loss = self.model.get_label_reg_loss(desc_vectors, contexts, labels)
             else:
                 reg_loss = torch.tensor(0.0, device=bce_loss.device)
             loss = bce_loss + args.lmbda * reg_loss
@@ -248,8 +260,9 @@ class Trainer:
                     doc_masks = doc_masks.cuda()
                     section_lengths = section_lengths.cuda()
                     section_masks = section_masks.cuda()
+
                 logits, _, _, _  = model(docs, doc_masks, doc_lengths, section_masks, section_lengths, adj = self.adj, leaf_idxs = self.leaf_idxs)
-                loss = model.get_multilabel_loss(labels, logits)
+                loss = self.model.get_multilabel_loss(labels, logits)
                 output = F.sigmoid(logits)
                 output = output.cpu().numpy() if torch.cuda.is_available() else output.numpy()
                 losses.append(loss.cpu().item() if torch.cuda.is_available() else loss.item())
@@ -363,8 +376,8 @@ if __name__ == '__main__':
     parser.add_argument('--method', type=str, default='caml', help='which model use to train (e.g. caml, hierarchy')
     parser.add_argument('--use_ontology', type=bool, default=False, help="if use knowledge ontology")
     parser.add_argument('--use_hierarchy', type=bool, default=False, help="if use hierarchy cnn")
-
-
+   
+    
     ## hyper parameters
     parser.add_argument("--num_filter_maps", type=int, default=50, help="size of conv output (default: 50)")
     parser.add_argument("--embed_size", type=int, default=100, help="word embed size (default: 100)")
@@ -379,6 +392,8 @@ if __name__ == '__main__':
     parser.add_argument("--lmbda", type=float, default=0,
                         help="hyperparameter to tradeoff BCE loss and similarity embedding loss. defaults to 0, which won't create/use the description embedding module at all. ")
     parser.add_argument('--max_length', type=int, default=2500, help="max length for document")
+    parser.add_argument('--num_layers', type=int, default=5, help='number of dense layers')
+    parser.add_argument('--drop_rate', type=float, default=0.0, help='drop rate for multi-scale cnn')
 
     ## train policy parameter
     parser.add_argument('--grad_clip_value', type=float, default=0.75, help="parameter grad clip threhold (default: 0.35)")
