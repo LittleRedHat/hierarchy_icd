@@ -3,6 +3,77 @@ from sklearn.metrics import precision_recall_curve
 from sklearn.metrics import average_precision_score
 import numpy as np
 
+
+
+def all_metrics_ordered(yhat, y, k=8, probs = None, cal_auc = True):
+    """
+        yhat: ordered labels 
+        y: ordered ground truth labels
+        probs: every probs
+    """
+    yhat = yhat.astype(np.int)
+    y = y.astype(np.int)
+
+    names = ["acc", "prec", "rec", "f1"]
+    batch_size, steps = yhat.shape
+
+    classes = steps - 1 ## there are end token which means before end token is treat as positive while after treat as negtive
+
+    yhat_positive_num = np.argmax(yhat, axis=1).astype(np.int)
+    y_positive_num = np.argmax(y, axis=1).astype(np.int)
+
+    yhat_binary = np.zeros((batch_size, classes))
+    y_binary = np.zeros((batch_size, classes))
+    yhat_ordered = []
+    y_ordered = []
+    
+    for bi in range(batch_size):
+        yhat_mask = yhat_positive_num[bi]
+        y_mask = y_positive_num[bi]
+
+        yhat_index = yhat[bi, :yhat_mask] - 1
+        yhat_binary[bi, yhat_index] = 1.0
+
+        y_index = y[bi, :y_mask] - 1
+        y_binary[bi, y_index] = 1.0
+        
+
+        yhat_ordered.append(np.concatenate((yhat[bi, :yhat_mask], yhat[bi, (yhat_mask + 1):])))
+
+        y_ordered.append(y[bi, :y_mask])
+    
+    yhat_ordered = np.array(yhat_ordered)
+
+    #macro
+    macro = all_macro(yhat_binary, y_binary)
+
+    #micro
+    ymic = y_binary.ravel()
+    yhatmic = yhat_binary.ravel()
+    micro = all_micro(yhatmic, ymic)
+
+    metrics = {names[i] + "_macro": macro[i] for i in range(len(macro))}
+    metrics.update({names[i] + "_micro": micro[i] for i in range(len(micro))})
+
+
+    ## AUC and @k
+    if probs is not None and cal_auc:
+        if type(k) != list:
+            k = [k]
+        for k_i in k:
+            rec_at_k = recall_at_k_ordered(yhat_ordered, y_ordered, k_i)
+            metrics['rec_at_%d' % k_i] = rec_at_k
+            prec_at_k = precision_at_k_ordered(yhat_ordered, y_ordered, k_i)
+            metrics['prec_at_%d' % k_i] = prec_at_k
+            metrics['f1_at_%d' % k_i] = 2*(prec_at_k*rec_at_k)/(prec_at_k+rec_at_k)
+
+        # roc_auc = auc_metrics_order(yhat_raw, y, ymic)
+        # metrics.update(roc_auc)
+
+
+    return metrics
+
+
 def all_metrics(yhat, y, k=8, yhat_raw=None, calc_auc=True):
     """
         Inputs:
@@ -100,6 +171,20 @@ def inst_f1(yhat, y):
 # AT-K
 ##############
 
+def recall_at_k_ordered(yhat, y, k):
+    """
+        yhat: ordered label list
+        y: ordered groud truth label list
+    """
+    vals = []
+    topk = yhat[:, :k]
+    for bi, tk in enumerate(topk):
+        if len(tk) > 0 and len(y[bi]) > 0:
+            num_true_in_k = len(np.intersect1d(y[bi], tk))
+            denom = len(y[bi])
+            vals.append(num_true_in_k / float(denom))
+    return np.mean(topk)
+
 def recall_at_k(yhat_raw, y, k):
     #num true labels in top k predictions / num true labels
     sortd = np.argsort(yhat_raw)[:,::-1]
@@ -116,6 +201,24 @@ def recall_at_k(yhat_raw, y, k):
     vals[np.isnan(vals)] = 0.
 
     return np.mean(vals)
+
+def precision_at_k_ordered(yhat, y, k):
+    """
+        yhat: ordered label list
+        y: ordered groud truth label list
+    """
+    vals = []
+    topk = yhat[:, :k]
+    for bi, tk in enumerate(topk):
+        if len(tk) > 0:
+            num_true_in_k = len(np.intersect1d(y[bi], tk))
+            denom = len(tk)
+            vals.append(num_true_in_k / float(denom))
+
+    return np.mean(topk)
+
+
+
 
 def precision_at_k(yhat_raw, y, k):
     #num true labels in top k predictions / k
@@ -313,6 +416,7 @@ def union_size(yhat, y, axis):
 def intersect_size(yhat, y, axis):
     #axis=0 for label-level union (macro). axis=1 for instance-level
     return np.logical_and(yhat, y).sum(axis=axis).astype(float)
+
 
 
 

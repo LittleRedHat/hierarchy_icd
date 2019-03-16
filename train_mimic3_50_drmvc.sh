@@ -5,14 +5,17 @@ python train.py --vocab_file ./mimicdata/mimic3/vocab.csv \
                 --train_file ./mimicdata/mimic3/train_50.csv \
                 --dev_file ./mimicdata/mimic3/dev_50.csv \
                 --test_file ./mimicdata/mimic3/test_50.csv \
-                --save_dir caml \
-                --batch_size 32 \
+                --save_dir drmvc \
+                --batch_size 4 \
                 --gpus 0 \
                 --epochs 200 \
                 --lmbda 0 \
-                --num_filter_maps 150 \
-                --word_kernel_sizes 10 \
+                --num_filter_maps 90 \
+                --word_kernel_sizes 10,8,6,4 \
+                --label_kernel_sizes 7,5,3 \
+                --use_desc 1 \
                 --nw 0 \
                 --lr 0.0001 \
                 --log_frq 10 \
-                --method caml
+                --max_length 10000 \
+                --method mvc

@@ -4,6 +4,8 @@ class BasicConf:
     MAX_LENGTH = 2500
     PAD_CHAR = "**PAD**"
     
+    
+    
 
 
 

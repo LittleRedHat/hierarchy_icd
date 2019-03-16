@@ -5,15 +5,18 @@ python train.py --vocab_file ./mimicdata/mimic3/vocab.csv \
                 --train_file ./mimicdata/mimic3/train_FULL.csv \
                 --dev_file ./mimicdata/mimic3/dev_FULL.csv \
                 --test_file ./mimicdata/mimic3/test_FULL.csv \
-                --save_dir structure \
-                --batch_size 32 \
+                --save_dir multiscale-full \
+                --batch_size 8 \
+                --num_layers 6 \
+                --drop_rate 0.0 \
                 --gpus 2 \
                 --epochs 200 \
                 --lmbda 0 \
-                --nw 0 \
+                --num_filter_maps 200 \
+                --use_desc 1 \
+                --code_set 1 \
+                --nw 4 \
                 --lr 0.0001 \
-                --num_filter_maps 50 \
-                --word_kernel_sizes 10,8,6,4 \
-                --section_kernel_size 4 \
-                --method hierarchy \
-                --log_frq 10
+                --log_frq 10 \
+                --max_length 2500 \
+                --method multiscale

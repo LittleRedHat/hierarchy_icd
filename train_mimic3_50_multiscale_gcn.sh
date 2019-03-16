@@ -4,20 +4,18 @@ python train.py --vocab_file ./mimicdata/mimic3/vocab.csv \
                 --description_file ./mimicdata/mimic3/description_vectors.vocab \
                 --train_file ./mimicdata/mimic3/train_50.csv \
                 --dev_file ./mimicdata/mimic3/dev_50.csv \
-                --relation_file ./mimicdata/mimic3/TOP_50_relation.csv \
                 --test_file ./mimicdata/mimic3/test_50.csv \
-                --save_dir structure-gcn \
+                --save_dir multiscale-gcn \
                 --batch_size 32 \
-                --gpus 0 \
+                --num_layers 6 \
+                --drop_rate 0.0 \
+                --gpus 2 \
                 --epochs 200 \
                 --lmbda 0 \
-                --nw 0 \
+                --num_filter_maps 200 \
+                --use_ontology 1 \
+                --nw 4 \
                 --lr 0.0001 \
-                --num_filter_maps 300 \
-                --word_kernel_sizes 10,8,6,4 \
-                --section_kernel_size 3 \
-                --method hierarchy-gcn \
-                --max_length 4000 \
                 --log_frq 10 \
-                --use_hierarchy 1 \
-                --use_ontology 1
+                --max_length 4000 \
+                --method multiscale

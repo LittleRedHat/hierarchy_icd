@@ -3,35 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .layers import GraphConvolution
 from torch.nn.init import xavier_uniform_
+from torch.nn.utils.rnn import pack_padded_sequence as pack
+from torch.nn.utils.rnn import pad_packed_sequence as unpack
 from math import floor
 import numpy as np
 from .utils import normalize, sparse_mx_to_torch_sparse_tensor
-
-
-class ResnetBlock(nn.Module):
-    def __init__(self, channel_size):
-        super(ResnetBlock, self).__init__()
-        self.channel_size = channel_size
-        self.maxpool = nn.Sequential(
-            nn.ConstantPad1d(padding=(0, 1), value=0),
-            nn.MaxPool1d(kernel_size=3, stride=2)
-        )
-        self.conv = nn.Sequential(
-            nn.BatchNorm1d(num_features=self.channel_size),
-            nn.ReLU(),
-            nn.Conv1d(self.channel_size, self.channel_size,
-                      kernel_size=3, padding=1),
-            nn.BatchNorm1d(num_features=self.channel_size),
-            nn.ReLU(),
-            nn.Conv1d(self.channel_size, self.channel_size,
-                      kernel_size=3, padding=1),
-        )
-
-    def forward(self, x):
-        x_shortcut = self.maxpool(x)
-        x = self.conv(x_shortcut)
-        x = x + x_shortcut
-        return x
+from .layers import luong_gate_attention, DenseLayer, DualPathBlock, ResnetBlock
 
 class DPCNN(nn.Module):
     def __init__(self, num_classes, embed_size, num_filter_maps, dropout, vocab_size = None, init_embeds = None):
@@ -57,33 +34,206 @@ class DPCNN(nn.Module):
         self.use_ontology = use_ontology
         self.num_filter_maps = num_filter_maps
 
+class MultiScaleCNN_Seq2Seq(nn.Module):
+    def __init__(self, num_classes, embed_size, vocab_size, hidden_size, label_embed_size, init_embed = None, dropout = 0.15, cell='gru', enc_num_layers = 2, bidirectional = False, dec_num_layers=2, attention_type='luong_gate'):
+        super(MultiScaleCNN_Seq2Seq, self).__init__()
+
+        self.embed_drop = nn.Dropout(p=dropout)
+        if init_embeds is None:
+            self.embed = nn.Embedding(vocab_size + 2, embed_size, padding_idx=0)
+        else:
+            self.embed = nn.Embedding.from_pretrained(torch.from_numpy(init_embeds), freeze = embed_freeze)
+            self.embed.padding_idx = 0
+
+        self.trans_layers = nn.ModuleList(modules=[
+            nn.Sequential(*[
+                nn.Conv1d(embed_size, num_filter_maps, kernel_size=1),
+                nn.BatchNorm1d(num_filter_maps),
+                nn.SELU(inplace=True)
+            ]),
+            nn.Sequential(*[
+                nn.Conv1d(num_filter_maps, num_filter_maps, kernel_size=1),
+                nn.BatchNorm1d(num_filter_maps),
+                nn.SELU(inplace=True)
+            ])
+        ])
+
+        self.multi_scale_layers = nn.ModuleList(
+            [
+                DenseLayer((i + 1) * num_filter_maps, num_filter_maps, drop_rate=drop_rate, pooling=pooling & (i != num_layers - 1)) for i in range(num_layers)
+            ]
+        )
+        total_layers = 1 + len(self.multi_scale_layers)
 
 
-class _DenseLayer(nn.Sequential):
-    def __init__(self, num_input_features, num_output_features, drop_rate):
-        super(_DenseLayer, self).__init__()
-        # self.add_module('norm1', nn.BatchNorm2d(num_input_features)),
-        # self.add_module('relu1', nn.ReLU(inplace=True)),
-        # self.add_module('conv1', nn.Conv2d(num_input_features, bn_size *
-        #                 growth_rate, kernel_size=1, stride=1, bias=False)),
-        # self.add_module('norm2', nn.BatchNorm2d(bn_size * growth_rate)),
-        # self.add_module('relu2', nn.ReLU(inplace=True)),
-        # self.add_module('conv2', nn.Conv2d(bn_size * growth_rate, growth_rate,
-        #                 kernel_size=3, stride=1, padding=1, bias=False)),
-        self.add_module('conv1', nn.Conv1d(num_input_features, num_output_features, kernel_size=3, stride=1, padding=1))
-        self.add_module('bn1', nn.BatchNorm1d(num_output_features))
-        self.add_module('relu1', nn.ELU(inplace=True))
-        # self.add_module('tanh', nn.Tanh())
-        self.drop_rate = drop_rate
+        self.attention_affine = nn.Sequential(*[
+            nn.Conv1d(total_layers * num_filter_maps, total_layers * num_filter_maps, kernel_size=1, stride=1, groups=total_layers),
+            nn.BatchNorm1d(total_layers * num_filter_maps),
+            nn.SELU(inplace=True)
+        ])
 
-    def forward(self, x):
-        new_features = super(_DenseLayer, self).forward(x)
-        if self.drop_rate > 0:
-            new_features = F.dropout(new_features, p=self.drop_rate, training=self.training)
-        return torch.cat([x, new_features], 1)
+
+        ## decoder ##
+        ## <BOS> -> 0 <EOS> -> last tokens
+        self.code_embed = nn.Embedding(num_classes + 2, label_embed_size)
+        self.decoder = nn.GRU(input_size=label_embed_size, hidden_size=hidden_size, num_layers = dec_num_layers, dropout=dropout, batch_first=True)
+        self.num_classes = num_classes
+
+        ## add <EOS>, <BOS> token
+        self.dec_linear = nn.Linear(hidden_size, num_classes + 2)
+
+        for m in self.modules():
+            if isinstance(m, (nn.Linear, nn.Conv1d)):
+                xavier_uniform_(m.weight)
+
+    def compute_loss(self, logits, target):
+        logprobs = F.log_softmax(logits, dim=-1)
+
+        mask = torch.zeros((target.size(0), target.size(1)), dtype=torch.float, device=logits.device)
+
+        valid_elements = torch.nonzero(target)
+        mask[valid_elements[:, 0], valid_elements[:, 1]] = 1.0
+
+        loss = -1 * logprobs.gather(2, target.unsqueeze(2)).squeeze(2) ## bs * cs
+        loss = loss * mask
+        loss = loss.mean()
+        return loss
+
+
+    def encoder_forward(self, docs, doc_lengths):
+
+       
+
+    def decoder_forward(self, input, state, conv, context):
+
+        embeds = self.code_embed(input)
+
+        output, state = self.decoder(embeds, state)
+
+        output, attn_weights = self.attention(output, conv, context)
+
+        output = self.dec_linear(output)
+        return output, state, attn_weights
+
+
+    def forward(self, docs, doc_masks, doc_lengths, target):
+
+        context, conv, state = self.encoder_forward(docs, doc_lengths)
+
+        batch_size = docs.size(0)
+
+        pad = torch.zeros((batch_size, 1), device=docs.device, dtype=torch.long)
+
+        dec_input = torch.cat((pad, target[:, :-1]), dim=1)
+        logits, state, attn = self.decoder_forward(dec_input, state, conv, context)
+        return logits
+    
+    def sample(self, docs, doc_masks, doc_lengths, steps, take_all = False):
+        context, conv, enc_state = self.encoder_forward(docs, doc_lengths)
+        batch_size = docs.size(0)
+
+        dec_input = torch.zeros((batch_size, 1), device=docs.device, dtype=torch.long)
+        dec_state = enc_state
+        
+        results = torch.zeros((batch_size, steps), dtype=torch.long, device=docs.device)
+        probs = torch.zeros((batch_size, steps), dtype=torch.float, device=docs.device)
+
+        for si in range(steps):
+            logits, dec_state, attn = self.decoder_forward(dec_input, dec_state, conv, context)
+
+            logits = logits.squeeze(1)
+            preds = F.softmax(logits, dim=-1)
+
+            ## ensure get different labels
+            prev_ix = torch.nonzero(results)
+            if prev_ix.size(0):
+                preds[prev_ix[:, 0], prev_ix[:, 1]] = 0.0 ## batch * classes
+            ##
+            preds[:, 0] = 0.0
+            ps, dec_input = torch.max(preds, dim=-1)
+
+            results[:, si] = dec_input
+            probs[:, si] = ps
+
+            dec_input = dec_input.unsqueeze(1)
+    
+        return results, probs
+
+    def beam_sample(self, docs, doc_lengths, beam_size = 5, steps = -1, take_all = False):
+        context, conv, enc_state = self.encoder_forward(docs, doc_lengths)
+        batch_size = docs.size(0)
+
+        seqlogprobs = torch.tensor((steps, batch_size), dtype=torch.float, device=docs.device)
+        seq = torch.tensor((steps, batch_size), dtype=torch.long, device=docs.device)
+
+        done_beams = [[] for _ in range(batch_size)]
+
+        for bi in range(batch_size):
+            init_state = torch.expand(enc_state[0][bi], (beam_size, -1)), torch.expand(enc_state[1][bi], (beam_size, -1))
+            init_conv = torch.expand(conv[bi], (beam_size, -1, -1))
+            init_context = torch.expand(context[bi], (beam_size, -1, -1))
+
+            init_seq = torch.zeros((beam_size, 1), dtype=torch.long, device=docs.device)
+            logits, state, attn = self.decoder_forward(init_seq, init_state, init_conv, init_context)
+            init_logprobs = F.log_softmax(logits, dim=-1)
+
+            done_beams[bi] = self.beam_search(init_state, init_logprobs, init_conv, init_context, steps, beam_size)
+
+    def beam_search(self, init_state, init_logprobs, init_conv, init_context, steps, beam_size):
+        device = init_logprobs.device
+
+        def beam_step(logprobs, beam_size, t, beam_seq, beam_seq_logprobs, beam_logprobs_sum, state):
+            ys, ix = torch.sort(logprobs, dim=1, descending=True)
+            rows = beam_size
+            cols = min(beam_size, ys.size(1))
+            candidates = []
+            if t == 0:
+                rows = 1
+            for c in range(cols): ## for every word
+                for r in range(rows): ## for every beam
+                    local_logprob = ys[r, c].item()
+                    candidate_logprob = beam_logprobs_sum[r] + local_logprob
+                    candidates.append({'c':ix[r, c],'r':r, 'p':candidate_logprob, 'l':local_logprob})
+            candidates = sorted(candidates, key=lambda x:-x['p'])
+            if t >= 1:
+                beam_seq_prev = beam_seq[:t].clone()
+                beam_seq_logprobs_prev = beam_seq_logprobs[:t].clone()
+
+            new_state = [_.clone() for _ in state]
+
+            for vix in range(beam_size):
+                v = condidates[vix]
+                if t >= 1:
+                    beam_seq[:t, vix] = beam_seq_prev[:, v['q']]
+                    beam_seq_logprobs[:t, vix] = beam_seq_logprobs_prev[:, v['q']]
+
+                    for state_ix in range(len(new_state)):
+                        new_state[state_ix][vix] = state[state_ix][v['q']]
+                    
+                    beam_seq[t, vix] = v['c']
+                    beam_seq_logprobs[t, vix] = v['l']
+                    beam_logprobs_sum[vix] = v['p']
+            state = new_state
+            return beam_seq, beam_seq_logprobs, beam_logprobs_sum, state, candidates
+
+        beam_seq = torch.tensor((steps, beam_size), device=device, dtype=torch.long)
+        beam_seq_logprobs = torch.zeros((steps, beam_size), dtype=torch.float, device=device)
+        beam_logprobs_sum = torch.zeros(beam_size, dtype=torch.float, device=device)
+        state = init_state
+        logprobs = init_logprobs
+        context = init_context
+        conv = init_conv
+        for si in range(steps):
+            beam_seq, beam_seq_logprobs, beam_logprobs_sum, state, candidates = beam_step(logprobs, beam_size, si, beam_seq, beam_seq_logprobs, beam_logprobs_sum, state)
+
+            input = beam_seq[si].unsqueeze(1) ## beam_size * 1
+            if input.sum() == 0:
+                break
+            logits, state, attn = self.decoder_forward(input, state, conv, context)
+            logprobs = F.log_softmax(logits, dim=-1)
 
 class MultiScaleCNN(nn.Module):
-    def __init__(self, num_classes, embed_size, num_filter_maps, dropout, num_layers = 5, vocab_size = None, init_embeds = None, embed_freeze = False, drop_rate=0.0, use_ontology=False, total_num_classes=None):
+    def __init__(self, num_classes, embed_size, num_filter_maps, dropout, num_layers = 5, pooling = False, vocab_size = None, init_embeds = None, embed_freeze = False, drop_rate=0.0, use_ontology=False, use_desc=False, total_num_classes=None):
         super(MultiScaleCNN, self).__init__()
         self.embed_drop = nn.Dropout(p=dropout)
         if init_embeds is None:
@@ -91,37 +241,49 @@ class MultiScaleCNN(nn.Module):
         else:
             self.embed = nn.Embedding.from_pretrained(torch.from_numpy(init_embeds), freeze = embed_freeze)
             self.embed.padding_idx = 0
-        
+
         self.trans_layers = nn.ModuleList(modules=[
             nn.Sequential(*[
                 nn.Conv1d(embed_size, num_filter_maps, kernel_size=1),
                 nn.BatchNorm1d(num_filter_maps),
-                nn.ELU(inplace=True)
-                # nn.ReLU(inplace=True),
-                # nn.Tanh()
+                nn.SELU(inplace=True)
             ]),
-            # nn.Sequential(*[
-            #     nn.Conv1d(num_filter_maps, num_filter_maps, kernel_size=1),
-            #     nn.BatchNorm1d(num_filter_maps),
-            #     nn.ELU(inplace=True)
-            #     # nn.ReLU(inplace=True),
-            #     # nn.Tanh()
-            # ]),
-            # nn.Sequential(*[
-            #     nn.Conv1d(num_filter_maps, num_filter_maps, kernel_size=1),
-            #     nn.BatchNorm1d(num_filter_maps),
-            #     nn.ELU(inplace=True)
-            #     # nn.ReLU(inplace=True),
-            #     # nn.Tanh()
-            # ])
+            nn.Sequential(*[
+                nn.Conv1d(num_filter_maps, num_filter_maps, kernel_size=1),
+                nn.BatchNorm1d(num_filter_maps),
+                nn.SELU(inplace=True)
+            ])
         ])
-        self.multi_scale_layers = nn.Sequential(
-            *[
-                _DenseLayer((len(self.trans_layers) + i) * num_filter_maps, num_filter_maps, drop_rate=drop_rate) for i in range(num_layers)
-            ]
-        )
-        self.total_layers = len(self.trans_layers) + len(self.multi_scale_layers)
+        # self.multi_scale_layers = nn.ModuleList(
+        #     [
+        #         DenseLayer((i + 1) * num_filter_maps, num_filter_maps, drop_rate=drop_rate, pooling=pooling & (i != num_layers - 1)) for i in range(num_layers)
+        #     ]
+        # )
+        # total_layers = 1 + len(self.multi_scale_layers)
 
+        in_chs = num_filter_maps
+        k_r = 256
+        groups = 32
+        modules = [
+            DualPathBlock(in_chs, k_r, k_r, num_filter_maps, num_filter_maps, groups, block_type='proj', b = False)
+        ]
+        in_chs += 2 * num_filter_maps
+        for i in range(1, num_layers):
+            m = DualPathBlock(
+                in_chs, k_r, k_r, num_filter_maps, num_filter_maps, groups, block_type='normal', b = False
+            )
+            in_chs += num_filter_maps
+
+            modules.append(m)
+        self.multi_scale_layers = nn.ModuleList(modules)
+        total_layers = 2 + len(self.multi_scale_layers)
+
+
+        self.attention_affine = nn.Sequential(*[
+            nn.Conv1d(total_layers * num_filter_maps, total_layers * num_filter_maps, kernel_size=1, stride=1, groups=total_layers),
+            nn.BatchNorm1d(total_layers * num_filter_maps),
+            nn.SELU(inplace=True)
+        ])
         self.final = nn.Linear(num_filter_maps, num_classes)
         xavier_uniform_(self.final.weight)
 
@@ -136,22 +298,71 @@ class MultiScaleCNN(nn.Module):
         
         self.use_ontology = use_ontology
         self.num_filter_maps = num_filter_maps
+        self.use_desc = use_desc
+
+        if use_desc > 0:
+            label_kernel_size = [1, 3, 5]
+            self.desc_embed = nn.Embedding(vocab_size + 2, embed_size, padding_idx=0)
+            self.desc_embed.weight.data = self.embed.weight.data.clone()
+            self.conv_label = nn.ModuleList([nn.Conv1d(embed_size, num_filter_maps, kernel_size=kernel, padding=int(floor(kernel / 2))) for kernel in label_kernel_size])
+            self.label_fc1 = nn.Linear(num_filter_maps, num_filter_maps)
+            xavier_uniform_(self.label_fc1.weight)
+        
 
         for m in self.modules():
             if isinstance(m, nn.Linear) or isinstance(m, nn.Conv1d):
                 xavier_uniform_(m.weight)
-            else:
-                pass
+    
+    def embed_description(self, descs):
+        """
+            descs: batch_size * 
+        """
+        d = self.desc_embed(descs) ##  number * embed_size
+        d = d.transpose(1, 2)
+        ds = []
+        for conv in self.conv_label:
+            ds.append(F.tanh(conv(d))) ## num_classes * num_filter_maps * words
+        ds = torch.stack(ds, dim=0)
+        d, _ = torch.max(ds, dim=0)
 
-    def get_multilabel_loss(self, target, yhat):
-        loss = F.binary_cross_entropy_with_logits(yhat, target)
+        # d = F.tanh(self.conv_label(d))
+        d = F.max_pool1d(d, kernel_size=d.size()[2])
+        d = d.squeeze(2)
+        d = self.label_fc1(d)
+        return d
+
+    def embed_propagation(self, input_feats, adj):
+        features = self.gcn(input_feats, adj)
+        return features
+    
+    def get_multilabel_loss(self, target, logits, eps=1e-8):
+        
+        # device = target.device
+        # yhat = F.sigmoid(logits)
+        # yhat = torch.clamp(yhat, eps, 1-eps)
+        # y = torch.full((target.size(0), target.size(1)), -1, device=target.device, dtype=torch.long)
+        # for bi in range(target.size(0)):
+        #     inds = torch.nonzero(target[bi])[:, 0]
+        #     y[bi, :inds.size(0)] = inds
+        # loss = F.multilabel_margin_loss(yhat, y)
+        # return loss
+
+
+        # probs = F.softmax(logits, dim=-1)
+        # probs = torch.clamp(probs, eps, 1-eps)
+        # target = target / torch.sum(target, dim = 1, keepdim = True)
+        # loss = -1 * torch.sum(torch.log(probs) * target) / probs.shape[0]
+        # return loss
+
+        loss = F.binary_cross_entropy_with_logits(logits, target)
         return loss
 
-    def forward(self, docs, doc_masks, doc_lengths, section_masks, section_lengths, adj=None, leaf_idxs=None):
+    def forward(self, docs, doc_masks, doc_lengths, adj=None, leaf_idxs=None, code_desc = None, code_set = None):
 
         word_u = self.word_U.weight
         if self.use_ontology:
             word_u_final = self.embed_propagation(word_u, adj)[leaf_idxs]
+            word_u = word_u[leaf_idxs]
 
         batch_size = docs.size(0)
         device = docs.device
@@ -165,31 +376,56 @@ class MultiScaleCNN(nn.Module):
             output = layer(output)
             transition_layers_output.append(output)
         
-        multi_scale_layer_input = torch.cat(transition_layers_output, dim=1)
-        multi_scale_output = self.multi_scale_layers(multi_scale_layer_input) ## batch_size * (total_layers * num_filter_maps) * words
-        multi_scale_output = multi_scale_output.reshape(batch_size, -1, self.num_filter_maps, multi_scale_output.size(-1)) ## batch_size * total_layers * num_filter_maps * words
+        # multi_scale_layer_input = torch.cat(transition_layers_output, dim=1)
+        multi_scale_output = output
+        for module in self.multi_scale_layers:
+            multi_scale_output = module(multi_scale_output)
+        # multi_scale_output = multi_scale_output.reshape(batch_size, -1, self.num_filter_maps, multi_scale_output.size(-1)) ## batch_size * total_layers * num_filter_maps * words
+        if isinstance(multi_scale_output, tuple):
+            multi_scale_output = torch.cat(multi_scale_output, dim=1)
         
+        # print(multi_scale_output.shape)
         ## calculate scale attention
+        multi_scale_output = self.attention_affine(multi_scale_output).reshape(batch_size, -1, self.num_filter_maps, multi_scale_output.size(-1)) ## batch_size * total_layers * num_filter_maps * words
+        scale = torch.sum(multi_scale_output, dim=2).permute(0, 2 , 1) ## batch_size * words * total_layers
+        scale = F.softmax(scale, dim=-1).permute(0, 2, 1) ## batch_size * total_layers * words
 
-
+        multi_scale_output =  multi_scale_output * scale.unsqueeze(2)
+        multi_scale_output = torch.sum(multi_scale_output, dim=1) ## batch_size * num_filter_maps * words
 
         ## calculate word attention
-        multi_scale_output, _ = torch.max(multi_scale_output, dim=1)
-        alpha = F.softmax(word_u.matmul(multi_scale_output), dim=2)
-        context = alpha.matmul(multi_scale_output.transpose(1, 2)) 
+        # multi_scale_output = multi_scale_output.reshape(batch_size, -1, self.num_filter_maps, multi_scale_output.size(-1)) ## batch_size * total_layers * num_filter_maps * words
+        # multi_scale_output, _ = torch.max(multi_scale_output, dim=1)
 
-        if self.use_ontology:
-            y = word_u_final.mul(context).sum(dim=2)
+        if code_set is not None:
+            alpha = F.softmax(word_u[code_set].matmul(multi_scale_output), dim=2)
+            context = alpha.matmul(multi_scale_output.transpose(1, 2)) 
+            if self.use_ontology:
+                y = word_u_final[code_set].mul(context).sum(dim=2)
+            elif self.use_desc:
+                weight = self.embed_description(code_desc[code_set])
+                y = weight.mul(context).sum(dim=2)
+            else:
+                y = self.final.weight[code_set].mul(context).sum(dim=2).add(self.final.bias[code_set])
         else:
-            y = self.final.weight.mul(context).sum(dim=2).add(self.final.bias)
-        
-        return y, context, None, None
-        
-        
+            alpha = F.softmax(word_u.matmul(multi_scale_output), dim=2)
+            context = alpha.matmul(multi_scale_output.transpose(1, 2))
+            
+            if self.use_ontology:
+                
+                y = word_u_final.mul(context).sum(dim=2)
+            elif self.use_desc:
+               
+                weight = self.embed_description(code_desc)
+                y = weight.mul(context).sum(dim=2)
+            else:
+                y = self.final.weight.mul(context).sum(dim=2).add(self.final.bias)
 
-class StrutureAwareHCN(nn.Module):
-    def __init__(self, num_classes, embed_size, word_kernel_sizes, section_kernel_size, label_kernel_size, num_filter_maps, dropout, vocab_size = None, init_embeds = None, embed_freeze = False, code_embeds = None, lmbda = 0, method=None, use_ontology = False, use_hierarchy = False, use_desc = False, total_num_classes = -1):
-        super(StrutureAwareHCN, self).__init__()
+        return y, context, None, None
+
+class CAML(nn.Module):
+    def __init__(self, num_classes, embed_size, word_kernel_sizes, label_kernel_sizes, num_filter_maps, dropout, vocab_size = None, init_embeds = None, embed_freeze = False, code_embeds = None, lmbda = 0, method=None, use_ontology = False, use_desc = False, total_num_classes = -1):
+        super(CAML, self).__init__()
         modules = []
         for kernel_size in word_kernel_sizes:
             conv_word = nn.Conv1d(embed_size, num_filter_maps, kernel_size, padding=int(floor(kernel_size / 2)))
@@ -197,9 +433,6 @@ class StrutureAwareHCN(nn.Module):
             modules.append(conv_word)
     
         self.convs_word = nn.ModuleList(modules=modules)
-        if use_hierarchy:
-            self.conv_section = nn.Conv1d(num_filter_maps, num_filter_maps, section_kernel_size, padding=int(floor(section_kernel_size / 2)))
-            xavier_uniform_(self.conv_section.weight)
 
         self.embed_drop = nn.Dropout(p=dropout)
         if init_embeds is None:
@@ -208,10 +441,6 @@ class StrutureAwareHCN(nn.Module):
             self.embed = nn.Embedding.from_pretrained(torch.from_numpy(init_embeds), freeze = embed_freeze)
             self.embed.padding_idx = 0
 
-
-        self.text_length_affine = nn.Linear(1, num_classes)
-        xavier_uniform_(self.text_length_affine.weight)
-
         self.final = nn.Linear(num_filter_maps, num_classes)
         xavier_uniform_(self.final.weight)
 
@@ -219,29 +448,11 @@ class StrutureAwareHCN(nn.Module):
         self.num_filter_maps = num_filter_maps
         self.lmbda = lmbda
         self.method = method
+        self.use_desc = use_desc
 
-        self.use_hierarchy = use_hierarchy
         self.use_ontology = use_ontology
 
-        if use_hierarchy and use_ontology:
-            self.word_U = nn.Linear(num_filter_maps, total_num_classes)
-            xavier_uniform_(self.word_U.weight)
-
-            ## context vector for section-level
-            self.section_U = nn.Linear(num_filter_maps, num_classes)
-            xavier_uniform_(self.section_U.weight)
-            self.gcn = GCN(num_filter_maps, num_filter_maps, dropout = 0.15)
-
-        elif use_hierarchy:
-            ## context vector for word-level
-            self.word_U = nn.Linear(num_filter_maps, num_classes)
-            xavier_uniform_(self.word_U.weight)
-
-            ## context vector for section-level
-            self.section_U = nn.Linear(num_filter_maps, num_classes)
-            xavier_uniform_(self.section_U.weight)
-
-        elif use_ontology:
+        if use_ontology:
             self.word_U = nn.Linear(num_filter_maps, total_num_classes)
             xavier_uniform_(self.word_U.weight)
             self.gcn = GCN(num_filter_maps, num_filter_maps, dropout = 0.15)
@@ -249,46 +460,22 @@ class StrutureAwareHCN(nn.Module):
         else:
             self.word_U = nn.Linear(num_filter_maps, num_classes)
             xavier_uniform_(self.word_U.weight)
-        
-      
-
-
-
-        # if self.method in ['caml', 'mvc', 'hierarchy']:
-        #     ## context vector for word-level
-        #     self.word_U = nn.Linear(num_filter_maps, num_classes)
-        #     xavier_uniform_(self.word_U.weight)
-        #     if self.method in ['hierarchy']:
-        #         ## context vector for section-level
-        #         self.section_U = nn.Linear(num_filter_maps, num_classes)
-        #         xavier_uniform_(self.section_U.weight)
-
-        # elif self.method in ['hierarchy-gcn']:
-        #     self.word_U = nn.Linear(num_filter_maps, total_number_classes)
-        #     xavier_uniform_(self.word_U.weight)
-
-        #     ## context vector for section-level
-        #     self.section_U = nn.Linear(num_filter_maps, num_classes)
-        #     xavier_uniform_(self.section_U.weight)
-
-        #     self.gcn = GCN(num_filter_maps, num_filter_maps, dropout = 0.15)
-        
 
         if code_embeds is not None:
             ## init code embed
             self.code_embed_init(code_embeds)
 
-        if lmbda > 0:
+        if use_desc:
             self.desc_embed = nn.Embedding(vocab_size + 2, embed_size, padding_idx=0)
             self.desc_embed.weight.data = self.embed.weight.data.clone()
-
-            self.conv_label = nn.Conv1d(embed_size, num_filter_maps, kernel_size=label_kernel_size, padding=int(floor(label_kernel_size/2)))
-            xavier_uniform_(self.conv_label.weight)
-
+            self.conv_label = nn.ModuleList([nn.Conv1d(embed_size, num_filter_maps, kernel_size=kernel, padding=int(floor(kernel / 2))) for kernel in label_kernel_sizes])
             self.label_fc1 = nn.Linear(num_filter_maps, num_filter_maps)
             xavier_uniform_(self.label_fc1.weight)
-        
-        
+
+        for m in self.modules():
+            if isinstance(m, (nn.Linear, nn.Conv1d)):
+                xavier_uniform_(m.weight)
+
         # self.gcn = GCN(num_filter_maps, num_filter_maps)
 
     def embed_propagation(self, input_feats, adj):
@@ -302,31 +489,20 @@ class StrutureAwareHCN(nn.Module):
         loss = loss.sum(1)
         # return loss.mean()
         return loss.mean()
-    
 
     def get_multilabel_loss(self, target, yhat):
         loss = F.binary_cross_entropy_with_logits(yhat, target)
         return loss
-
-        # probs = F.sigmoid(yhat)
-        # loss = self.focal_loss(probs, target)
-        # return loss
     
     def get_label_reg_loss(self, desc_data, contexts, target):
         """
-
         """
-        # print(desc_data)
         device = contexts.device
-        b_batch = self.embed_description_v2(desc_data, device)
-
+        b_batch = self.embed_description(desc_data, device)
         diff = self.compare_label_embeddings(target, b_batch)
-        # if diffs is not None:
-        #     diffs = torch.stack(diffs).mean()
         return diff
 
-
-    def caml(self, docs, doc_masks, doc_lengths, adj=None, leaf_idxs=None):
+    def caml(self, docs, doc_masks, doc_lengths, adj=None, leaf_idxs=None, code_desc=None):
         word_u = self.word_U.weight
         if self.use_ontology:
             word_u_final = self.embed_propagation(word_u, adj)[leaf_idxs]
@@ -338,38 +514,22 @@ class StrutureAwareHCN(nn.Module):
         multi_word_features = []
         for module in self.convs_word:
             word_features = module(docs)
-            # word_features = word_features[:, :self.num_filter_maps] * F.tanh(word_features[:, self.num_filter_maps:])
             word_features = F.tanh(word_features)
             multi_word_features.append(word_features)
         multi_word_features = torch.stack(multi_word_features, dim=0).transpose(0,1) ## batch_size * kernel_num *  num_filter_maps * words
-        ###################
-        # alpha = word_u.matmul(multi_word_features) ## batch_size * kernel_num * num_classes * words
-
-        # scale_attention = F.softmax(alpha, dim=1) ## batch_size * kernel_num * num_classes * words
-        # word_attention = F.softmax(alpha, dim=-1) ## batch_size * kernel_num * num_classes * words
-        # final_attention = (scale_attention * word_attention)
-        # # final_attention = torch.sum(final_attention, dim=1)
-        # context = final_attention.matmul(multi_word_features.transpose(2, 3)) ## batch_size * kernel_num * num_classes * num_filter_maps
-        # context = torch.sum(context, dim=1) ## batch_size * num_classes * num_filter
-        # if self.use_ontology:
-        #     y = word_u_final.mul(context).sum(dim=2)
-        # else:
-        #     y = self.final.weight.mul(context).sum(dim=2).add(self.final.bias)
-        # # if self.method == 'mvc':
-        # #     text_affine = self.text_length_affine.weight.mul(doc_lengths.float() / 2500.0).transpose(0, 1) ## batch_size * num_class
-        # #     y = y + F.sigmoid(text_affine)
-        # return y, context, None, None
 
         ####################
-
         ## max-pooling over kernel
         word_features, _ = torch.max(multi_word_features, dim=1) ## batch_size * num_filter_maps * words
         alpha = F.softmax(word_u.matmul(word_features), dim=2)
         context = alpha.matmul(word_features.transpose(1, 2))
-        # y = self.final.weight.mul(context).sum(dim=2).add(self.final.bias)
-        # print(word_u.shape, context.shape)
+
         if self.use_ontology:
             y = word_u_final.mul(context).sum(dim=2)
+        
+        elif self.use_desc:
+            weight = self.embed_description(code_desc)
+            y = weight.mul(context).sum(dim=2)
         else:
             y = self.final.weight.mul(context).sum(dim=2).add(self.final.bias)
         # if self.method == 'mvc':
@@ -377,186 +537,46 @@ class StrutureAwareHCN(nn.Module):
         #     y = y + F.sigmoid(text_affine)
         return y, context, None, None
 
-    def forward(self, docs, doc_masks, doc_lengths, section_masks, section_lengths, adj=None, leaf_idxs=None):
-        if not self.use_hierarchy:
-            return self.caml(docs, doc_masks, doc_lengths, adj=adj, leaf_idxs=leaf_idxs)
-        else:
-            return self.hierarchy(docs, doc_masks, doc_lengths, section_masks, section_lengths, adj=adj, leaf_idxs=leaf_idxs)
-
-    ## structure-aware attention without label graph propagation
-    def hierarchy(self, docs, doc_masks, doc_lengths, section_masks, section_lengths, adj = None, leaf_idxs=None):
-        """
-            Inputs:
-                docs: batch_size * words * embed_size
-                doc_masks: batch_size * words
-                section_masks: batch_size * section_num
-                section_lengths: batch_size * section_num
-            Outputs:
-                yhat: logits
-                context: final document representation
-                beta: section weights
-                alphas: word weights
-        """
-        word_u = self.word_U.weight
-        section_u = self.section_U.weight
-        if self.use_ontology:
-            # print('using graph propagation')
-            word_u = self.embed_propagation(word_u, adj)[leaf_idxs]
-            # section_u = self.embed_propagation(section_u, self.adj)[self.leaf_idxs]
-        
-
-        device = section_masks.device
-        section_num = section_masks.size(1)
-        batch_size = section_masks.size(0)
-        doc_words = docs.size(1)
-        docs = self.embed(docs)
-        docs = self.embed_drop(docs)
-        docs = docs.transpose(1, 2)
-        multi_word_features = []
-        for module in self.convs_word:
-            word_features = F.tanh(module(docs))
-            multi_word_features.append(word_features)
-
-        multi_word_features = torch.stack(multi_word_features, dim=0).transpose(0,1) ## batch_size * kernel_num *  num_filter_maps * words
-        ## max-pooling over kernel
-        # word_features = multi_word_features[:,0]
-        
-        word_features, _ = torch.max(multi_word_features, dim=1) ## batch_size * num_filter_maps * words
+    def forward(self, docs, doc_masks, doc_lengths, adj=None, leaf_idxs=None, code_desc=None, code_set=None):
+        return self.caml(docs, doc_masks, doc_lengths, adj=adj, leaf_idxs=leaf_idxs, code_desc=code_desc)
 
 
-        # ##                                 ##
-        # ##                                 ##
-        # ##                                 ##
-        # ##                                 ##
-        section_start_indexs = torch.zeros(batch_size, device = device, requires_grad=False, dtype=torch.long)
-        section_features = []
-
-        for i in range(section_num):
-            max_section_length = torch.max(section_lengths[:, i])
-            section_word_masks = torch.zeros((batch_size, max_section_length), device=device, dtype=torch.float)
-            section_alphas = torch.zeros((batch_size, self.num_classes, max_section_length), device=device, dtype=torch.float)
-            section_words_features = torch.zeros((batch_size, self.num_filter_maps, max_section_length), device=device, dtype=torch.float)
-
-            for batch_idx in range(batch_size):
-                section_start_index = section_start_indexs[batch_idx]
-                section_length = section_lengths[batch_idx, i]
-                if section_length > 0:
-                    tmp = word_features[batch_idx, :, section_start_index:(section_start_index + section_length)]
-                    section_words_features[batch_idx, :, :section_length] = tmp
-                    # section_alphas[batch_idx, :, :section_length] = alphas_origin[batch_idx, :, section_start_index:(section_start_index + section_length)]
-            section_feature = F.max_pool1d(section_words_features, kernel_size=max_section_length).squeeze(-1)
-            section_features.append(section_feature)
-
-        section_features = torch.stack(section_features, dim=0).transpose(0, 1) ## batch_size * section_num * num_filter_maps
-
-
-
-
-        ##                                 ##
-        ##                                 ##
-        ##                                 ##
-        ##                                 ##
-        
-
-
-
-
-
-
-        # section_start_indexs = torch.zeros(batch_size, device = device, requires_grad=False, dtype=torch.long)
-        # section_features = []
-        # alphas = torch.zeros((batch_size, self.num_classes, doc_words), device=device)
-
-        # for i in range(section_num):
-        #     ## section-based attentional pooling over words
-        #     max_section_length = torch.max(section_lengths[:, i])
-        #     # PAD = torch.zeros((max_section_length, self.num_filter_maps) , device=device, dtype=torch.float)
-        #     section_word_masks = torch.zeros((batch_size, max_section_length), device=device, dtype=torch.float)
-
-        #     section_words_features = torch.zeros((batch_size, self.num_filter_maps, max_section_length), device=device, dtype=torch.float)
-
-        #     for batch_idx in range(batch_size):
-        #         section_start_index = section_start_indexs[batch_idx]
-        #         section_length = section_lengths[batch_idx, i]
-        #         if section_length > 0:
-        #             tmp = word_features[batch_idx, :, section_start_index:(section_start_index + section_length)]
-        #             # section_words_features.append(tmp)
-        #             section_words_features[batch_idx, :, :section_length] = tmp
-        #         # else:
-        #         #     section_words_features.append(PAD)
-        #         section_start_indexs[batch_idx] += section_length
-        #         section_word_masks[batch_idx, :section_length] = 1.0
-
-        #     # section_word_masks = torch.tensor(section_word_masks, device=device, dtype=torch.float) ## batch_size * words
-        #     # section_words_features = torch.stack(section_words_features, dim=0) ## batch_size * num_filter_maps * words
-
-        #     alpha_origin = word_u.matmul(section_words_features)
-        #     alpha = F.softmax(alpha_origin, dim=2) ## batch_size * num_classes * words
-        #     alpha = (alpha * section_word_masks.unsqueeze(1))
-        #     alpha = alpha + 1e-8
-        #     alpha = alpha / torch.sum(alpha, dim=-1, keepdim=True)
-
-        #     for batch_idx in range(batch_size):
-        #         section_length = section_lengths[batch_idx, i]
-        #         section_end_index = section_start_indexs[batch_idx]
-        #         if section_length > 0:
-        #             alphas[batch_idx, :, (section_end_index - section_length):section_end_index] = alpha[batch_idx, :, :section_length]
-
-        #     section_feature = alpha.matmul(section_words_features.transpose(1, 2)) ## batch_size * num_classes * num_filter_maps
-        #     section_features.append(section_feature)
-
-        # section_features = torch.stack(section_features, dim=0).transpose(0, 1).transpose(1, 2) ## batch_size * num_classes * section_num * num_filter_maps
-        # section_features = section_features.reshape(-1,section_num, self.num_filter_maps).transpose(1, 2) ## (batch_size * num_classes) * num_filter_maps * section_num
-
-        # ## section feature encode
-        # section_representation = F.tanh(self.conv_section(section_features))
-        # section_representation = section_representation.reshape(batch_size, -1, self.num_filter_maps, section_num) ## batch_size * num_classes * num_filter_maps * section_num
-        # section_representation = section_representation.permute([0, 1, 3, 2]) ## batch_size * num_classes * section_num * num_filter_maps 
-        # ## section-level attention
-
-        # """
-        #     note there must be class aware
-        # """
-        # # print(section_representation.shape)
-        # # print(self.section_U.weight.unsqueeze(2).shape)
-        # beta_origin = torch.matmul(section_representation, section_u.unsqueeze(2)).squeeze(3) ## batch_size * num_classes * section_num
-        # beta = F.softmax(beta_origin, dim=2)
-        # beta = beta + 1e-8
-        # beta = (beta * section_masks.unsqueeze(1))
-        # beta = beta / torch.sum(beta, dim=-1, keepdim=True)
-
-        # ## top-down attention
-        # """
-        #     if beta * (alpha * word_representation)
-        # """
-        # section_features = section_features.reshape(batch_size, -1, self.num_filter_maps, section_num).permute([0, 1, 3, 2]) ## batch_size * num_classes * section_num * num_filter_maps 
-        # context = torch.matmul(beta.unsqueeze(2), section_features).squeeze(2) ## batch_size * num_classes * num_filter_maps
-        # # """
-        # #     if softmax(beta * alpha_origin)
-        # # """
-        # # y = self.final(context).squeeze(-1)
-        # y = self.final.weight.mul(context).sum(dim=2).add(self.final.bias)
-        # return y, context, beta, alphas
-
-
-    def embed_description(self, descs, device):
+    def embed_description(self, descs):
         """
             descs: batch_size * 
         """
-        b_batch = []
-        for inst in descs:
-            if len(inst) > 0:
-                b_batch = b_batch + inst
-        b_batch = np.array(b_batch)
-        lt = torch.tensor(b_batch, dtype=torch.long, device=device)
-        d = self.desc_embed(lt) ##  number * embed_size
+        d = self.desc_embed(descs) ##  number * embed_size
         d = d.transpose(1, 2)
-        d = F.tanh(self.conv_label(d))
+        ds = []
+        for conv in self.conv_label:
+            ds.append(F.tanh(conv(d))) ## num_classes * num_filter_maps * words
+        ds = torch.stack(ds, dim=0)
+        d, _ = torch.max(ds, dim=0)
 
+        # d = F.tanh(self.conv_label(d))
         d = F.max_pool1d(d, kernel_size=d.size()[2])
         d = d.squeeze(2)
-        b_inst = self.label_fc1(d)
-        return b_inst
+        d = self.label_fc1(d)
+        return d
+
+    # def embed_description(self, descs, device):
+    #     """
+    #         descs: batch_size * 
+    #     """
+    #     b_batch = []
+    #     for inst in descs:
+    #         if len(inst) > 0:
+    #             b_batch = b_batch + inst
+    #     b_batch = np.array(b_batch)
+    #     lt = torch.tensor(b_batch, dtype=torch.long, device=device)
+    #     d = self.desc_embed(lt) ##  number * embed_size
+    #     d = d.transpose(1, 2)
+    #     d = F.tanh(self.conv_label(d))
+
+    #     d = F.max_pool1d(d, kernel_size=d.size()[2])
+    #     d = d.squeeze(2)
+    #     b_inst = self.label_fc1(d)
+    #     return b_inst
 
     def embed_description_v2(self, descs, device):
         b_batch = []
@@ -582,21 +602,6 @@ class StrutureAwareHCN(nn.Module):
         # b_inst = self.label_fc1(d)
         b_inst = d
         return b_inst
-
-        # for inst in descs:
-        #     if len(inst) > 0:
-        #         lt = torch.tensor(inst, dtype=torch.long, device=device)
-        #         d = self.desc_embed(lt) ##  actual_classes * length * embed_size
-        #         d = d.transpose(1, 2)
-        #         d = self.conv_label(d)
-        #         d = F.max_pool1d(F.tanh(d), kernel_size=d.size()[2])
-        #         d = d.squeeze(2)
-        #         b_inst = self.label_fc1(d)
-        #         b_batch.append(b_inst)
-        #     else:
-        #         b_batch.append([])
-        # return b_batch
-
     def compare_label_embeddings(self, target, b_batch):
         #description regularization loss
         #b_batch is the embedding from description conv (flatten)
@@ -647,8 +652,6 @@ class StrutureAwareHCN(nn.Module):
             code_embeds: num_classes * embed_size
         """
         self.word_U.weight.data = torch.tensor(code_embeds).clone()
-        if self.use_hierarchy:
-            self.section_U.weight.data = torch.tensor(code_embeds).clone()
 
 class DenseAttnGraph(nn.Module):
     def __init__(self):
@@ -656,7 +659,6 @@ class DenseAttnGraph(nn.Module):
 
     def forward(self, x):
         pass
-
 
 class GCN(nn.Module):
     def __init__(self, nfeat, nhid, dropout = 0.2):
@@ -673,4 +675,3 @@ class GCN(nn.Module):
         # return F.log_softmax(x, dim=1)
         return x
 
-    

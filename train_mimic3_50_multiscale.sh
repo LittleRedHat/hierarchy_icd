@@ -9,7 +9,7 @@ python train.py --vocab_file ./mimicdata/mimic3/vocab.csv \
                 --batch_size 32 \
                 --num_layers 5 \
                 --drop_rate 0.0 \
-                --gpus 0 \
+                --gpus 1 \
                 --epochs 200 \
                 --lmbda 0 \
                 --num_filter_maps 150 \

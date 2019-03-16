@@ -5,17 +5,14 @@ python train.py --vocab_file ./mimicdata/mimic3/vocab.csv \
                 --train_file ./mimicdata/mimic3/train_50.csv \
                 --dev_file ./mimicdata/mimic3/dev_50.csv \
                 --test_file ./mimicdata/mimic3/test_50.csv \
-                --save_dir structure \
+                --save_dir seq2seq \
                 --batch_size 32 \
-                --gpus 2 \
-                --epochs 200 \
-                --lmbda 0 \
+                --gpus 1 \
+                --epochs 100 \
                 --nw 0 \
                 --lr 0.0001 \
-                --num_filter_maps 150 \
-                --word_kernel_sizes 10,8,6,4 \
-                --section_kernel_size 3 \
-                --method hierarchy \
-                --max_length 4000 \
                 --log_frq 10 \
-                --use_hierarchy 1
+                --method seq2seq \
+                --cell gru \
+                --hidden_size 256 \
+                --label_embed_size 150

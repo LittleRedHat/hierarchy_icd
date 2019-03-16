@@ -12,13 +12,14 @@ from models.utils import normalize, sparse_mx_to_torch_sparse_tensor
 
 
 class MIMICDataset(Dataset):
-    def __init__(self, notes_file, dicts, mode = 'train', desc_embed=False, max_length = 2500, args={}):
+    def __init__(self, notes_file, dicts, mode = 'train', desc_embed=False, max_length = 2500, args={}, order=None):
         super(MIMICDataset, self).__init__()
         self.notes = load_notes(notes_file, args = args)
         self.dicts = dicts
         self.max_length = max_length
+        self.mode = mode
+        self.order = order
         print('max length for document is {}'.format(self.max_length))
-
 
     def __getitem__(self, index):
         note = self.notes.iloc[index]
@@ -26,23 +27,31 @@ class MIMICDataset(Dataset):
         labels = note['LABELS']
         hadm = note['HADM_ID']
 
-        labels = set(str(labels).split(';'))
-
-        if 'nan' in labels:
-            labels =  labels.remove('nan')
+        ordered_labels = str(labels).split(';')
+        if 'nan' in ordered_labels:
+            ordered_labels =  ordered_labels.remove('nan')
         
-        if labels is None:
-            labels = set()
+        if ordered_labels is None:
+            ordered_labels = []
+       
+        labels = set(ordered_labels)
 
         c2ind = self.dicts['c2ind']  
         label_idxs = np.zeros(len(c2ind))
         code_set = set()
-       
         for label in labels:
             if label in c2ind:
                 label_idxs[c2ind[label]] = 1.0
                 code_set.add(c2ind[label])
-            
+        
+        ## note that 
+        ordered_label_idxs = []
+        for label in ordered_labels:
+            if label in c2ind:
+                ordered_label_idxs.append(c2ind[label] + 1)
+        if self.order == 'frequency':
+            ordered_label_idxs = sorted(ordered_label_idxs)
+        ordered_label_idxs = np.array(ordered_label_idxs)
         ## encode doc
         """
            split document to max length 
@@ -50,22 +59,12 @@ class MIMICDataset(Dataset):
         w2ind = self.dicts['w2ind']
        
         doc = []
-        section_length = []
-        current_length = 0
         MAX_LENGTH = self.max_length
         for section in text:
-            remained_length = MAX_LENGTH - current_length
-            if remained_length <= 0:
-                break
-            
             content = section['content'].split()
+            doc = doc + content
+        doc = doc[:MAX_LENGTH]
 
-            actual_added_length = min(remained_length, len(content))
-            section_length.append(actual_added_length)
-            doc = doc + content[:actual_added_length]
-            current_length += actual_added_length
-            
-        section_length = np.array(section_length)
         doc_idx = []
         for word in doc:
             if word in w2ind:
@@ -73,7 +72,6 @@ class MIMICDataset(Dataset):
             else:
                 doc_idx.append(len(w2ind) + 1)
 
-        
         """
             load description vector according to label index
         """
@@ -87,30 +85,17 @@ class MIMICDataset(Dataset):
                 current_idxs.append(c2ind[label])
         current_idxs = sorted(current_idxs)
 
-        
+
         desc_lengths = []
         for idx in current_idxs:
             label = ind2c[idx]
             vector = dv_dict[label]
-            # desc = ' '.join([ind2w.get(v,'UNK') for v in vector])
-            # print(label,desc)
             desc_lengths.append(len(vector))
             desc_vectors.append(vector)
 
-        ## pad description vector
-        # max_desc_length = max(desc_lengths)
-        # pad_desc_vectors = []
-        # for vector in desc_vectors:
-        #     pad_vector = vector + [0] * (max_desc_length - len(vector))
-        #     pad_desc_vectors.append(pad_vector)
-      
-    
-
         doc_idx = np.array(doc_idx)
-        section_num = len(section_length)
-        doc_length = sum(section_length) 
-        # print(hadm, doc_idx, label_idxs, doc_length, section_num, section_length, pad_desc_vectors)
-        return hadm, doc_idx, label_idxs, doc_length, section_num, section_length, desc_vectors, desc_lengths, code_set
+        doc_length = len(doc_idx)
+        return hadm, doc_idx, label_idxs, ordered_label_idxs, doc_length, desc_vectors, desc_lengths, code_set
 
 
     def __len__(self):
@@ -137,8 +122,7 @@ class MIMICDataset(Dataset):
         return data_loader
 
     def collate_fn(self, data):
-        hadms, docs, labels, doc_lengths, section_nums, section_lengths, desc_vectors, desc_lengths, code_sets = zip(*data)
-        max_section_num = max(section_nums)
+        hadms, docs, labels, ordered_labels, doc_lengths, desc_vectors, desc_lengths, code_sets = zip(*data)
         ## pad extra for section_num align
         max_doc_length = max(doc_lengths)
         
@@ -151,12 +135,12 @@ class MIMICDataset(Dataset):
             targets[i, :len(doc)] = doc
             doc_masks[i, :len(doc)] = 1.0
         
-        section_masks = np.zeros((len(docs), max_section_num), dtype=np.float32)
-        section_length_targets = np.zeros((len(docs), max_section_num), dtype=np.int64)
-        ## pad section vec
-        for i, section_num in enumerate(section_nums):
-            section_masks[i, :section_num] = 1.0
-            section_length_targets[i, :section_num] = section_lengths[i][:section_num]
+        # section_masks = np.zeros((len(docs), max_section_num), dtype=np.float32)
+        # section_length_targets = np.zeros((len(docs), max_section_num), dtype=np.int64)
+        # ## pad section vec
+        # for i, section_num in enumerate(section_nums):
+        #     section_masks[i, :section_num] = 1.0
+        #     section_length_targets[i, :section_num] = section_lengths[i][:section_num]
 
         hadms = np.stack(hadms, axis=0)
         labels = np.stack(labels, axis=0).astype(np.float32)
@@ -182,20 +166,32 @@ class MIMICDataset(Dataset):
         
         batch_code_sets = set()
         for code_set in code_sets:
-            batch_code_sets.union(code_set)
+            batch_code_sets = batch_code_sets.union(code_set)
         
+        batch_code_sets = list(batch_code_sets)
+
+        max_label_len = max([len(r_l) for r_l in ordered_labels]) + 1
+
+        ## add <EOS> to end, pad with <BOS>
+        label_num = labels.shape[1] + 2
+        pad_ordered_labels = np.zeros((len(docs),max_label_len), dtype=np.int32)
+        label_seq_mask = np.zeros((len(docs),max_label_len), dtype=np.float32)
+
+        for i, r_l in enumerate(ordered_labels):
+            pad_ordered_labels[i, :len(r_l)] = r_l
+            pad_ordered_labels[i, len(r_l)] = label_num - 1
+            label_seq_mask[i, :len(r_l) + 1] = 1.0
+
         
 
         return hadms,\
                torch.from_numpy(targets),\
                torch.from_numpy(labels),\
+               torch.tensor(pad_ordered_labels, dtype=torch.long),\
                torch.from_numpy(doc_masks),\
-               torch.tensor(doc_lengths, dtype=torch.float),\
-               torch.from_numpy(section_length_targets),\
-               torch.from_numpy(section_masks),\
+               torch.tensor(doc_lengths, dtype=torch.long),\
                pad_desc_vectors, \
-               batch_code_sets
-
+               torch.tensor(batch_code_sets, dtype=torch.long)
 
 def code_reformat(code, is_diag):
     """
@@ -218,6 +214,7 @@ def code_reformat(code, is_diag):
 def load_notes(notes_file, args = {}):
     notes = pd.read_csv(notes_file, index_col=None, dtype={'HADM_ID':int})
     notes['TEXT'] = notes['TEXT'].apply(lambda x:ast.literal_eval(x))
+    # notes = notes.sort_values(by=['LENGTH'],ascending=False)
     # notes = notes.sort_values(by=['LENGTH'],reverse=True)
     return notes
 
@@ -331,8 +328,12 @@ def load_code_dict(label_file, args={}):
         for line in inf:
             line = line.rstrip()
             if line != '':
-                codes.append(line)
-    ## remove 36.01 36.02 36.05 48.81 719.70
+                items = line.split('\t')
+                code = items[0]
+                frq = int(items[1])
+                if code != '' and code not in ['36.01','36.02','36.05','488.1','719.70']:
+                    codes.append(code)
+
     ind2c = {i:c for i,c in enumerate(sorted(codes))}
     c2ind = {c:i for i, c in ind2c.items()}
     return ind2c, c2ind
@@ -365,8 +366,15 @@ def load_lookups(args, desc_embd = None, code_embed = None):
     else:
         dv_dict = None
     
+    if args.embed_file is not None:
+        init_embed = load_embeddings(args.embed_file)
+    else:
+        init_embed = None
+
     if args.relation_file is not None:
         adj, full_ind2c, full_c2ind = load_code_relations(args.relation_file)
+        adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
+        adj = sparse_mx_to_torch_sparse_tensor(adj)
         leaf_idxs = []
         for i in range(len(ind2c)):
             c = ind2c[i]
@@ -375,6 +383,26 @@ def load_lookups(args, desc_embd = None, code_embed = None):
         relation  = {'adj':adj,'ind2c':full_ind2c, 'c2ind':full_c2ind, 'leaf_idxs':leaf_idxs}
     else:
         relation = None
+    
+    if code_embed:
+        code_embed_dict = load_code_embeddings(args.code_embed_file)
+        embeds = []
+        for i in range(len(ind2c)):
+            code = ind2c[i]
+            vector = code_embed_dict[code]
+            embeds.append(vector)
+        embeds = np.array(code_embeds).astype(np.float32)
+    else:
+        embeds = None
+        
+    code_desc = []
+    if args.use_desc:
+        for i in range(len(ind2c)):
+            code = ind2c[i]
+            vector = dv_dict[code]
+            code_desc.append(vector)
+    else:
+        code_desc = None
 
-    dicts = {'ind2w': ind2w, 'w2ind': w2ind, 'ind2c': ind2c, 'c2ind': c2ind, 'desc': desc_dict, 'dv': dv_dict, 'relation':relation}
+    dicts = {'code_desc':code_desc, 'init_embed':init_embed, 'code_embed':embeds, 'ind2w': ind2w, 'w2ind': w2ind, 'ind2c': ind2c, 'c2ind': c2ind, 'desc': desc_dict, 'dv': dv_dict, 'relation':relation}
     return dicts

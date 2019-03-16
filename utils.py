@@ -4,7 +4,28 @@ import csv
 import sys
 import json
 import numpy as np
+from torch import optim 
+from torch.optim import lr_scheduler
 
+def print_metrics(metrics):
+    print()
+    if "auc_macro" in metrics.keys():
+        print("[MACRO] accuracy, precision, recall, f-measure, AUC")
+        print("        %.4f,   %.4f,    %.4f, %.4f,    %.4f" % (metrics["acc_macro"], metrics["prec_macro"], metrics["rec_macro"], metrics["f1_macro"], metrics["auc_macro"]))
+    else:
+        print("[MACRO] accuracy, precision, recall, f-measure")
+        print("        %.4f,   %.4f,    %.4f, %.4f" % (metrics["acc_macro"], metrics["prec_macro"], metrics["rec_macro"], metrics["f1_macro"]))
+
+    if "auc_micro" in metrics.keys():
+        print("[MICRO] accuracy, precision, recall, f-measure, AUC")
+        print("        %.4f,   %.4f,    %.4f, %.4f,    %.4f" % (metrics["acc_micro"], metrics["prec_micro"], metrics["rec_micro"], metrics["f1_micro"], metrics["auc_micro"]))
+    else:
+        print("[MICRO] accuracy, precision, recall, f-measure")
+        print("        %.4f,    %.4f,   %.4f, %.4f" % (metrics["acc_micro"], metrics["prec_micro"], metrics["rec_micro"], metrics["f1_micro"]))
+    for metric, val in metrics.items():
+        if metric.find("rec_at") != -1:
+            print("%s: %.4f" % (metric, val))
+    print()
 
 def normalize(mx):
     """Row-normalize sparse matrix"""
@@ -19,6 +40,7 @@ def save_metrics(metrics_hist_all, model_dir):
     with open(model_dir + "/metrics.json", 'w') as metrics_file:
         #concatenate dev, train metrics into one dict
         data = metrics_hist_all[0].copy()
+        data = {k:v for k, v in data.items()}
         data.update({"%s_te" % (name):val for (name,val) in metrics_hist_all[1].items()})
         data.update({"%s_tr" % (name):val for (name,val) in metrics_hist_all[2].items()})
         json.dump(data, metrics_file, indent=1)
@@ -79,6 +101,7 @@ def build_optimizer(params, opt):
     elif opt.optim == 'sgdm':
         return optim.SGD(params, opt.lr,momentum = opt.optim_alpha, weight_decay=opt.weight_decay)
     elif opt.optim == 'sgdmom':
+        print('using sgdmom optimizer')
         return optim.SGD(params, opt.lr, momentum = opt.optim_alpha, weight_decay=opt.weight_decay, nesterov=True)
     elif opt.optim == 'adam':
         return optim.Adam(params, opt.lr, (opt.optim_alpha, opt.optim_beta), opt.optim_epsilon, weight_decay=opt.weight_decay)

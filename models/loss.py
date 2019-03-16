@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 from torch.nn.modules import loss
+import torch.nn.functional as F
 
 class WARPLoss(loss.Module):
     def __init__(self, num_labels=204):
@@ -59,6 +60,7 @@ class MultiLabelSoftmaxRegressionLoss(loss.Module):
         super(MultiLabelSoftmaxRegressionLoss, self).__init__()
 
     def forward(self, input, target, eps=1e-10):
+        input = F.softmax(input, dim=-1)
         probs = torch.clamp(input, eps, 1-eps)
         target = target / torch.sum(target, dim = 1, keepdim = True)
         return -1 * torch.sum(torch.log(input) * target) / input.shape[0]
